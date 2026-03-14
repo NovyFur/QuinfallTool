@@ -2,11 +2,13 @@
 Crafting XP Calculator for Quinfall Tool
 XP level curve data sourced from: https://qfcodex.com/crafting-planner-desktop.html
 
-v3 changes:
-  - Removed inner scroll wrappers — entire tab fits without scrolling
-  - Per-tier workbench spinners (T1 qty / T2 qty / T3 qty) instead of single dropdown
-  - Materials table has Min / Expected / Max mode dropdown
-  - Window enlarged to 1100 x 900 to accommodate all panels
+v4 — XP formula rewrite based on user spreadsheet:
+  XP = Base XP × Buff Bracket × Package Bracket × PVP Bracket × Altar Layer
+
+  Buff Bracket   = 1.0 + Statue(0.40) + Clan(0.60) + Potion(0.10/0.15/0.20) + Clan Altar(1.10)
+  Package Bracket = Valuable Package(1.15) × Ordenus Secret(1.10) × Anostias Blessing(1.25)
+  PVP Bracket    = 1.25x if in PVP channel, else 1.0x
+  Altar Layer    = 3.10x if Personal Altar active, else 1.0x
 """
 
 import math
@@ -16,7 +18,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QSpinBox, QScrollArea, QFrame, QTableWidget,
     QTableWidgetItem, QHeaderView, QListWidget, QListWidgetItem,
     QAbstractItemView, QSplitter, QGridLayout, QLineEdit,
-    QDoubleSpinBox
+    QDoubleSpinBox, QCheckBox
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
@@ -131,17 +133,63 @@ PROFESSION_XP_CURVE = [
 
 MAX_LEVEL = 100
 
-# Workbench tier bonuses: (time_reduction_pct, double_craft_chance_pct)
-WORKBENCH_TIER = {
-    1: (0.0,  0.0),
-    2: (20.0, 5.0),
-    3: (40.0, 10.0),
+# Potion tiers: name → additive bonus to Buff Bracket
+POTION_TIERS = {
+    "None":              0.00,
+    "Common (+10%)":     0.10,
+    "Uncommon (+15%)":   0.15,
+    "Rare (+20%)":       0.20,
 }
 
+# Package bracket components
+PACKAGE_VALUABLE   = 1.15   # Valuable Package
+PACKAGE_ORDENUS    = 1.10   # Ordenus Secret
+PACKAGE_ANOSTIAS   = 1.25   # Anostias Blessing
+
+# Fixed multipliers
+PVP_MULT   = 1.25
+ALTAR_MULT = 3.10
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pure calculation helpers
+# XP formula helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def compute_xp_multiplier(statue: bool, clan: bool, potion_bonus: float,
+                           clan_altar: bool,
+                           pkg_valuable: bool, pkg_ordenus: bool, pkg_anostias: bool,
+                           pvp: bool, altar: bool) -> dict:
+    """
+    Compute the full XP multiplier breakdown.
+
+    Returns a dict with each bracket value and the final combined multiplier.
+    """
+    # Buff Bracket: additive sum, then used as multiplier
+    buff = 1.0
+    if statue:     buff += 0.40
+    if clan:       buff += 0.60
+    buff          += potion_bonus          # 0.0 / 0.10 / 0.15 / 0.20
+    if clan_altar: buff += 1.10
+
+    # Package Bracket: multiplicative
+    pkg = 1.0
+    if pkg_valuable: pkg *= PACKAGE_VALUABLE
+    if pkg_ordenus:  pkg *= PACKAGE_ORDENUS
+    if pkg_anostias: pkg *= PACKAGE_ANOSTIAS
+
+    pvp_mult   = PVP_MULT   if pvp   else 1.0
+    altar_mult = ALTAR_MULT if altar else 1.0
+
+    total = buff * pkg * pvp_mult * altar_mult
+
+    return {
+        'buff_bracket':    buff,
+        'pkg_bracket':     pkg,
+        'pvp_bracket':     pvp_mult,
+        'altar_layer':     altar_mult,
+        'total_xp_mult':   total,
+    }
+
+
 def xp_needed_between(from_level: int, to_level: int) -> int:
     if from_level >= to_level:
         return 0
@@ -170,10 +218,10 @@ def format_time_hms(total_seconds: float) -> str:
     total_seconds = int(total_seconds)
     if total_seconds <= 0:
         return "0s"
-    days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
+    days    = total_seconds // 86400
+    hours   = (total_seconds % 86400) // 3600
     minutes = (total_seconds % 3600) // 60
-    secs = total_seconds % 60
+    secs    = total_seconds % 60
     parts = []
     if days:    parts.append(f"{days}d")
     if hours:   parts.append(f"{hours}h")
@@ -202,58 +250,37 @@ def effective_double_chance(wb_double_pct: float, pet_pct: float,
     return min(1.0, max(0.0, 1.0 - (1.0 - wb) * (1.0 - pet) * (1.0 - lvl) * (1.0 - pot)))
 
 
-def effective_xp_multiplier(pet_pct: float, level_pct: float, potion_pct: float) -> float:
-    """All XP bonuses are multiplicative."""
-    return (1.0 + pet_pct / 100.0) * (1.0 + level_pct / 100.0) * (1.0 + potion_pct / 100.0)
-
-
-def crafts_needed_for_xp(xp_target: float, xp_per_craft_base: float,
-                          xp_mult: float, double_chance: float) -> dict:
+def crafts_needed_for_xp(xp_target: float, xp_per_craft_effective: float,
+                          double_chance: float) -> dict:
     """
-    Returns min / expected / max craft counts needed to reach xp_target.
+    Returns min / expected / max craft counts.
 
-    Each craft yields:
-      - 1x output (prob 1 − p): xp_base * xp_mult XP
-      - 2x output (prob p):     2 * xp_base * xp_mult XP
-
-    E[XP per craft] = xp_base * xp_mult * (1 + p)
-    Min crafts  = assume every craft is 2x
-    Max crafts  = assume no craft is 2x
+    E[XP per craft] = xp_eff * (1 + p)
+    Min = all 2x procs, Max = no 2x procs
     """
-    if xp_per_craft_base <= 0:
+    if xp_per_craft_effective <= 0:
         return {'min': 0, 'expected': 0, 'max': 0}
 
-    xp_base = xp_per_craft_base * xp_mult
-    xp_2x   = xp_base * 2.0
-    p       = double_chance
+    xp_2x = xp_per_craft_effective * 2.0
+    p     = double_chance
 
-    min_crafts      = math.ceil(xp_target / xp_2x) if p > 0 else math.ceil(xp_target / xp_base)
-    expected_crafts = math.ceil(xp_target / (xp_base * (1.0 + p)))
-    max_crafts      = math.ceil(xp_target / xp_base)
+    min_c = math.ceil(xp_target / xp_2x) if p > 0 else math.ceil(xp_target / xp_per_craft_effective)
+    exp_c = math.ceil(xp_target / (xp_per_craft_effective * (1.0 + p)))
+    max_c = math.ceil(xp_target / xp_per_craft_effective)
 
     return {
-        'min':      max(1, min_crafts),
-        'expected': max(1, expected_crafts),
-        'max':      max(1, max_crafts),
+        'min':      max(1, min_c),
+        'expected': max(1, exp_c),
+        'max':      max(1, max_c),
     }
 
 
 def combine_workbench_bonuses(t1_qty: int, t2_qty: int, t3_qty: int,
                                pet_time: float, lvl_time: float, pot_time: float,
-                               pet_double: float, lvl_double: float, pot_double: float
-                               ) -> dict:
-    """
-    Combine bonuses from mixed workbench tiers.
-
-    Strategy: compute a weighted-average workbench bonus based on quantities,
-    then apply pet/level/potion multipliers on top.
-
-    Weighted wb_time_pct  = (t2*20 + t3*40) / total_stations
-    Weighted wb_double_pct = (t2*5  + t3*10) / total_stations
-    """
+                               pet_double: float, lvl_double: float, pot_double: float) -> dict:
     total = t1_qty + t2_qty + t3_qty
     if total == 0:
-        total = 1  # avoid div/0; treat as 1 T1 station
+        total = 1
 
     wb_time_pct   = (t2_qty * 20.0 + t3_qty * 40.0) / total
     wb_double_pct = (t2_qty *  5.0 + t3_qty * 10.0) / total
@@ -280,6 +307,49 @@ _SPINBOX_SS = """
         border: 1px solid #555; border-radius: 4px; padding: 3px;
     }
 """
+
+_CHECK_SS = """
+    QCheckBox {
+        color: #fff;
+        font-size: 12px;
+        spacing: 6px;
+    }
+    QCheckBox::indicator {
+        width: 16px; height: 16px;
+        border: 1px solid #555;
+        border-radius: 3px;
+        background: #1a1a1a;
+    }
+    QCheckBox::indicator:checked {
+        background: #00d4ff;
+        border: 1px solid #00d4ff;
+    }
+    QCheckBox::indicator:hover {
+        border: 1px solid #00d4ff;
+    }
+"""
+
+_COMBO_SS = """
+    QComboBox {
+        background: #ffffff; color: #000000;
+        border: 1px solid #555; border-radius: 4px; padding: 4px;
+        font-weight: bold;
+    }
+    QComboBox QAbstractItemView {
+        background: #ffffff; color: #000000;
+        selection-background-color: #00d4ff;
+        selection-color: #000;
+    }
+"""
+
+_PANEL_SS = lambda border: f"""
+    QFrame {{
+        background: rgba(22,22,30,230);
+        border-radius: 8px;
+        border: 1px solid {border};
+    }}
+"""
+
 
 def _pct_spin(tip: str = "") -> QDoubleSpinBox:
     sb = QDoubleSpinBox()
@@ -311,32 +381,18 @@ def _hdr(text: str, color: str = "#00d4ff") -> QLabel:
     return lbl
 
 
-def _sub(text: str) -> QLabel:
+def _sub(text: str, color: str = "#aaa") -> QLabel:
     lbl = QLabel(text)
-    lbl.setStyleSheet("color:#aaa; font-size:12px;")
+    lbl.setStyleSheet(f"color:{color}; font-size:12px;")
     return lbl
 
 
-_PANEL_SS = lambda border: f"""
-    QFrame {{
-        background: rgba(22,22,30,230);
-        border-radius: 8px;
-        border: 1px solid {border};
-    }}
-"""
-
-_COMBO_SS = """
-    QComboBox {
-        background: #ffffff; color: #000000;
-        border: 1px solid #555; border-radius: 4px; padding: 4px;
-        font-weight: bold;
-    }
-    QComboBox QAbstractItemView {
-        background: #ffffff; color: #000000;
-        selection-background-color: #00d4ff;
-        selection-color: #000;
-    }
-"""
+def _chk(text: str, tip: str = "") -> QCheckBox:
+    cb = QCheckBox(text)
+    cb.setStyleSheet(_CHECK_SS)
+    if tip:
+        cb.setToolTip(tip)
+    return cb
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,9 +415,9 @@ class CraftingItemRow(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
 
-        name    = recipe.get('Name', 'Unknown')
-        xp      = parse_xp(recipe.get('XP Reward', '0 XP'))
-        secs    = parse_craft_time_seconds(recipe.get('Craft Time', '0 seconds'))
+        name = recipe.get('Name', 'Unknown')
+        xp   = parse_xp(recipe.get('XP Reward', '0 XP'))
+        secs = parse_craft_time_seconds(recipe.get('Craft Time', '0 seconds'))
 
         name_lbl = QLabel(f"<b>{name}</b>")
         name_lbl.setMinimumWidth(160)
@@ -394,7 +450,6 @@ class CraftingCalculatorTab(QWidget):
     def __init__(self, recipes: list, parent=None):
         super().__init__(parent)
         self.all_recipes = recipes
-        # Stored calculation results for materials redraw
         self._last_items: list = []
         self._build_ui()
 
@@ -428,12 +483,10 @@ class CraftingCalculatorTab(QWidget):
 
         r1l.addWidget(_hdr("Current Level:"))
         self.current_lvl = _int_spin(0, 99, 1)
-        self.current_lvl.setFixedWidth(70)
         r1l.addWidget(self.current_lvl)
 
         r1l.addWidget(_hdr("Target Level:"))
         self.target_lvl = _int_spin(1, 100, 10)
-        self.target_lvl.setFixedWidth(70)
         r1l.addWidget(self.target_lvl)
 
         self.xp_needed_lbl = QLabel("XP Needed: —")
@@ -447,7 +500,7 @@ class CraftingCalculatorTab(QWidget):
         root.addWidget(row1)
 
         # ═══════════════════════════════════════════════════════════════════
-        # ROW 2 — Workbench Tiers + Stations
+        # ROW 2 — Workbench Tiers
         # ═══════════════════════════════════════════════════════════════════
         row2 = QFrame()
         row2.setStyleSheet(_PANEL_SS("#4a3a1a"))
@@ -457,92 +510,129 @@ class CraftingCalculatorTab(QWidget):
 
         r2l.addWidget(_hdr("🏭 Workbench Stations:", "#ffd700"))
 
-        # T1
-        t1_frame = QFrame()
-        t1_frame.setStyleSheet("QFrame { background: rgba(40,40,40,180); border-radius:6px; border:1px solid #555; }")
-        t1l = QHBoxLayout(t1_frame)
-        t1l.setContentsMargins(8, 4, 8, 4)
-        t1l.setSpacing(6)
-        t1l.addWidget(_sub("Tier 1:"))
-        self.wb_t1 = _int_spin(0, 999, 0, "Number of Tier 1 workbenches (no bonus)")
-        t1l.addWidget(self.wb_t1)
-        t1_info = QLabel("<span style='color:#888; font-size:10px;'>No bonus</span>")
-        t1l.addWidget(t1_info)
-        r2l.addWidget(t1_frame)
-
-        # T2
-        t2_frame = QFrame()
-        t2_frame.setStyleSheet("QFrame { background: rgba(30,50,30,180); border-radius:6px; border:1px solid #2e7d32; }")
-        t2l = QHBoxLayout(t2_frame)
-        t2l.setContentsMargins(8, 4, 8, 4)
-        t2l.setSpacing(6)
-        t2l.addWidget(_sub("Tier 2:"))
-        self.wb_t2 = _int_spin(0, 999, 0, "Number of Tier 2 workbenches (+20% time reduction, +5% 2x chance)")
-        t2l.addWidget(self.wb_t2)
-        t2_info = QLabel("<span style='color:#81c784; font-size:10px;'>−20% time | +5% 2x</span>")
-        t2l.addWidget(t2_info)
-        r2l.addWidget(t2_frame)
-
-        # T3
-        t3_frame = QFrame()
-        t3_frame.setStyleSheet("QFrame { background: rgba(30,30,60,180); border-radius:6px; border:1px solid #1565c0; }")
-        t3l = QHBoxLayout(t3_frame)
-        t3l.setContentsMargins(8, 4, 8, 4)
-        t3l.setSpacing(6)
-        t3l.addWidget(_sub("Tier 3:"))
-        self.wb_t3 = _int_spin(0, 999, 0, "Number of Tier 3 workbenches (+40% time reduction, +10% 2x chance)")
-        t3l.addWidget(self.wb_t3)
-        t3_info = QLabel("<span style='color:#64b5f6; font-size:10px;'>−40% time | +10% 2x</span>")
-        t3l.addWidget(t3_info)
-        r2l.addWidget(t3_frame)
+        for tier, color, border, info in [
+            (1, "rgba(40,40,40,180)", "#555",    "No bonus"),
+            (2, "rgba(30,50,30,180)", "#2e7d32", "−20% time | +5% 2x"),
+            (3, "rgba(30,30,60,180)", "#1565c0", "−40% time | +10% 2x"),
+        ]:
+            f = QFrame()
+            f.setStyleSheet(f"QFrame {{ background:{color}; border-radius:6px; border:1px solid {border}; }}")
+            fl = QHBoxLayout(f); fl.setContentsMargins(8,4,8,4); fl.setSpacing(6)
+            fl.addWidget(_sub(f"Tier {tier}:"))
+            sp = _int_spin(0, 999, 0, f"Number of Tier {tier} workbenches")
+            setattr(self, f"wb_t{tier}", sp)
+            fl.addWidget(sp)
+            fl.addWidget(QLabel(f"<span style='color:#888; font-size:10px;'>{info}</span>"))
+            r2l.addWidget(f)
 
         r2l.addStretch()
-
-        # Total stations display (auto-calculated)
         self.stations_lbl = QLabel("Total Stations: 0")
         self.stations_lbl.setStyleSheet("color:#ffd700; font-weight:bold; font-size:12px;")
         r2l.addWidget(self.stations_lbl)
 
-        # Update label when spinners change
         for sp in (self.wb_t1, self.wb_t2, self.wb_t3):
             sp.valueChanged.connect(self._update_stations_label)
         self._update_stations_label()
         root.addWidget(row2)
 
         # ═══════════════════════════════════════════════════════════════════
-        # ROW 3 — Bonus panels (3 columns, compact)
+        # ROW 3 — Craft Time / 2x Chance bonuses (compact) + XP Buffs (right)
         # ═══════════════════════════════════════════════════════════════════
         row3 = QHBoxLayout()
         row3.setSpacing(5)
 
-        # — Time Reduction —
+        # — Left column: Time Reduction + 2x Chance stacked vertically, compact —
+        left_col = QVBoxLayout()
+        left_col.setSpacing(4)
+
+        # Time Reduction — compact horizontal row
         tf = QFrame(); tf.setStyleSheet(_PANEL_SS("#1a3a6c"))
-        tfl = QGridLayout(tf); tfl.setContentsMargins(8,6,8,6); tfl.setSpacing(4)
-        tfl.addWidget(_hdr("⏱ Time Reduction"), 0, 0, 1, 2)
-        tfl.addWidget(_sub("Pet:"),    1, 0); self.time_pet    = _pct_spin("Pet time reduction"); tfl.addWidget(self.time_pet,    1, 1)
-        tfl.addWidget(_sub("Level:"),  2, 0); self.time_level  = _pct_spin("Level time reduction"); tfl.addWidget(self.time_level,  2, 1)
-        tfl.addWidget(_sub("Potion:"), 3, 0); self.time_potion = _pct_spin("Potion/buff time reduction"); tfl.addWidget(self.time_potion, 3, 1)
-        row3.addWidget(tf, 1)
+        tfl = QHBoxLayout(tf); tfl.setContentsMargins(8,5,8,5); tfl.setSpacing(8)
+        tfl.addWidget(_hdr("⏱ Time Reduction"))
+        tfl.addWidget(_sub("Pet:"))
+        self.time_pet = _pct_spin("Pet time reduction")
+        self.time_pet.setFixedWidth(78)
+        tfl.addWidget(self.time_pet)
+        tfl.addWidget(_sub("Level:"))
+        self.time_level = _pct_spin("Level time reduction")
+        self.time_level.setFixedWidth(78)
+        tfl.addWidget(self.time_level)
+        tfl.addWidget(_sub("Potion:"))
+        self.time_potion = _pct_spin("Potion time reduction")
+        self.time_potion.setFixedWidth(78)
+        tfl.addWidget(self.time_potion)
+        left_col.addWidget(tf)
 
-        # — 2x Chance —
+        # 2x Chance — compact horizontal row
         df = QFrame(); df.setStyleSheet(_PANEL_SS("#1a6c1a"))
-        dfl = QGridLayout(df); dfl.setContentsMargins(8,6,8,6); dfl.setSpacing(4)
-        dfl.addWidget(_hdr("🎲 2x Craft Chance", "#81c784"), 0, 0, 1, 2)
-        dfl.addWidget(_sub("Pet:"),    1, 0); self.double_pet    = _pct_spin("Pet 2x chance"); dfl.addWidget(self.double_pet,    1, 1)
-        dfl.addWidget(_sub("Level:"),  2, 0); self.double_level  = _pct_spin("Level 2x chance"); dfl.addWidget(self.double_level,  2, 1)
-        dfl.addWidget(_sub("Potion:"), 3, 0); self.double_potion = _pct_spin("Potion/buff 2x chance"); dfl.addWidget(self.double_potion, 3, 1)
-        row3.addWidget(df, 1)
+        dfl = QHBoxLayout(df); dfl.setContentsMargins(8,5,8,5); dfl.setSpacing(8)
+        dfl.addWidget(_hdr("🎲 2x Craft Chance", "#81c784"))
+        dfl.addWidget(_sub("Pet:"))
+        self.double_pet = _pct_spin("Pet 2x chance")
+        self.double_pet.setFixedWidth(78)
+        dfl.addWidget(self.double_pet)
+        dfl.addWidget(_sub("Level:"))
+        self.double_level = _pct_spin("Level 2x chance")
+        self.double_level.setFixedWidth(78)
+        dfl.addWidget(self.double_level)
+        dfl.addWidget(_sub("Potion:"))
+        self.double_potion = _pct_spin("Potion 2x chance")
+        self.double_potion.setFixedWidth(78)
+        dfl.addWidget(self.double_potion)
+        left_col.addWidget(df)
+        left_col.addStretch()
 
-        # — XP Buffs —
-        xf = QFrame(); xf.setStyleSheet(_PANEL_SS("#6c1a6c"))
-        xfl = QGridLayout(xf); xfl.setContentsMargins(8,6,8,6); xfl.setSpacing(4)
-        xfl.addWidget(_hdr("✨ XP Buffs", "#ce93d8"), 0, 0, 1, 2)
-        xfl.addWidget(_sub("Pet:"),    1, 0); self.xp_pet    = _pct_spin("Pet XP increase"); xfl.addWidget(self.xp_pet,    1, 1)
-        xfl.addWidget(_sub("Level:"),  2, 0); self.xp_level  = _pct_spin("Level XP increase"); xfl.addWidget(self.xp_level,  2, 1)
-        xfl.addWidget(_sub("Potion:"), 3, 0); self.xp_potion = _pct_spin("Potion/buff XP increase"); xfl.addWidget(self.xp_potion, 3, 1)
-        row3.addWidget(xf, 1)
+        left_widget = QWidget(); left_widget.setStyleSheet("background:transparent;")
+        left_widget.setLayout(left_col)
 
-        root.addLayout(row3)
+        # ── XP Buffs — compact two-row horizontal layout ─────────────────
+        xf = QFrame(); xf.setStyleSheet(_PANEL_SS("#6c3a1a"))
+        xfl = QVBoxLayout(xf); xfl.setContentsMargins(8,5,8,5); xfl.setSpacing(3)
+
+        # Row A: label + all checkboxes
+        xrow_a = QHBoxLayout(); xrow_a.setSpacing(10)
+        xrow_a.addWidget(_hdr("✨ XP Buffs", "#ffb74d"))
+        self.chk_statue     = _chk("Statue (+40%)",          "XP Statue buff")
+        self.chk_clan       = _chk("Clan (+60%)",            "Clan XP buff")
+        self.chk_clan_altar = _chk("Clan Altar (+110%)",     "Clan Altar XP buff")
+        self.chk_valuable   = _chk("Valuable Pkg (+15%)",    "Valuable Package ×1.15")
+        self.chk_ordenus    = _chk("Ordenus Secret (+10%)",  "Ordenus Secret ×1.10")
+        self.chk_anostias   = _chk("Anostias Blessing (+25%)", "Anostias Blessing ×1.25")
+        self.chk_pvp        = _chk("PVP Channel (+25%)",     "In a PVP channel ×1.25")
+        self.chk_altar      = _chk("Personal Altar (+210%)", "Personal Altar ×3.10")
+        for chk in (self.chk_statue, self.chk_clan, self.chk_clan_altar,
+                    self.chk_valuable, self.chk_ordenus, self.chk_anostias,
+                    self.chk_pvp, self.chk_altar):
+            xrow_a.addWidget(chk)
+        xfl.addLayout(xrow_a)
+
+        # Row B: potion dropdown + live multiplier preview
+        xrow_b = QHBoxLayout(); xrow_b.setSpacing(8)
+        xrow_b.addWidget(_sub("Potion:"))
+        self.potion_combo = QComboBox()
+        self.potion_combo.setStyleSheet(_COMBO_SS)
+        self.potion_combo.setMinimumWidth(160)
+        self.potion_combo.addItems(list(POTION_TIERS.keys()))
+        xrow_b.addWidget(self.potion_combo)
+        self.xp_mult_preview = QLabel("")
+        self.xp_mult_preview.setStyleSheet("color:#ffd700; font-weight:bold; font-size:11px;")
+        xrow_b.addWidget(self.xp_mult_preview)
+        xrow_b.addStretch()
+        xfl.addLayout(xrow_b)
+
+        # Connect all controls to preview update
+        for chk in (self.chk_statue, self.chk_clan, self.chk_clan_altar,
+                    self.chk_valuable, self.chk_ordenus, self.chk_anostias,
+                    self.chk_pvp, self.chk_altar):
+            chk.stateChanged.connect(self._update_xp_preview)
+        self.potion_combo.currentIndexChanged.connect(self._update_xp_preview)
+        self._update_xp_preview()
+
+        # Stack all three panels (Time / 2x / XP) vertically on the left
+        left_col.addWidget(xf)
+
+        row3.addWidget(left_widget, 1)
+        root.addLayout(row3, 0)
 
         # ═══════════════════════════════════════════════════════════════════
         # ROW 4 — Recipe picker (left) + Selected items (right)
@@ -594,7 +684,6 @@ class CraftingCalculatorTab(QWidget):
         sel_hdr.addWidget(clr_btn)
         rl.addLayout(sel_hdr)
 
-        # Column header
         ch = QFrame(); ch.setStyleSheet("QFrame{background:transparent;border:none;}")
         chl = QHBoxLayout(ch); chl.setContentsMargins(8,0,8,0)
         for txt, w in [("Item Name", None), ("Base XP", 65), ("Base Time", 58), ("", 26)]:
@@ -620,7 +709,7 @@ class CraftingCalculatorTab(QWidget):
         mid.addWidget(rf)
 
         mid.setSizes([260, 380])
-        root.addWidget(mid, 2)
+        root.addWidget(mid, 3)
 
         # ═══════════════════════════════════════════════════════════════════
         # ROW 5 — Calculate button
@@ -649,7 +738,7 @@ class CraftingCalculatorTab(QWidget):
         self.results_vbox.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.results_vbox.setSpacing(6)
         res_scroll.setWidget(self.results_widget)
-        root.addWidget(res_scroll, 3)
+        root.addWidget(res_scroll, 5)
 
         self._refresh_recipe_list()
 
@@ -666,6 +755,19 @@ class CraftingCalculatorTab(QWidget):
     def _update_stations_label(self):
         total = self.wb_t1.value() + self.wb_t2.value() + self.wb_t3.value()
         self.stations_lbl.setText(f"Total Stations: {total}")
+
+    def _update_xp_preview(self):
+        """Update the live XP multiplier preview label."""
+        xp_info = self._read_xp_buffs()
+        m = xp_info['total_xp_mult']
+        b = xp_info['buff_bracket']
+        p = xp_info['pkg_bracket']
+        pvp = xp_info['pvp_bracket']
+        alt = xp_info['altar_layer']
+        self.xp_mult_preview.setText(
+            f"Effective XP: ×{m:.3f}  "
+            f"(Buff {b:.2f} × Pkg {p:.3f} × PVP {pvp:.2f} × Altar {alt:.2f})"
+        )
 
     def _refresh_recipe_list(self):
         prof  = self.prof_combo.currentText()
@@ -714,6 +816,21 @@ class CraftingCalculatorTab(QWidget):
             if isinstance(self.items_vbox.itemAt(i).widget(), CraftingItemRow)
         ]
 
+    def _read_xp_buffs(self) -> dict:
+        """Read all XP buff checkboxes/dropdown and return the multiplier breakdown."""
+        potion_bonus = POTION_TIERS.get(self.potion_combo.currentText(), 0.0)
+        return compute_xp_multiplier(
+            statue      = self.chk_statue.isChecked(),
+            clan        = self.chk_clan.isChecked(),
+            potion_bonus= potion_bonus,
+            clan_altar  = self.chk_clan_altar.isChecked(),
+            pkg_valuable= self.chk_valuable.isChecked(),
+            pkg_ordenus = self.chk_ordenus.isChecked(),
+            pkg_anostias= self.chk_anostias.isChecked(),
+            pvp         = self.chk_pvp.isChecked(),
+            altar       = self.chk_altar.isChecked(),
+        )
+
     def _read_bonuses(self) -> dict:
         t1, t2, t3 = self.wb_t1.value(), self.wb_t2.value(), self.wb_t3.value()
         bonuses = combine_workbench_bonuses(
@@ -721,9 +838,9 @@ class CraftingCalculatorTab(QWidget):
             self.time_pet.value(), self.time_level.value(), self.time_potion.value(),
             self.double_pet.value(), self.double_level.value(), self.double_potion.value()
         )
-        bonuses['xp_mult'] = effective_xp_multiplier(
-            self.xp_pet.value(), self.xp_level.value(), self.xp_potion.value()
-        )
+        xp_info = self._read_xp_buffs()
+        bonuses['xp_mult']      = xp_info['total_xp_mult']
+        bonuses['xp_breakdown'] = xp_info
         return bonuses
 
     # ── Calculation ──────────────────────────────────────────────────────────
@@ -748,6 +865,7 @@ class CraftingCalculatorTab(QWidget):
             secs_raw = parse_craft_time_seconds(r.get('Craft Time', '0 seconds'))
             stations = bonuses['total_stations']
             secs_eff = (secs_raw * bonuses['time_mult']) / max(1, stations)
+            # Apply the full XP formula: Base × all brackets
             xp_eff   = xp_base * bonuses['xp_mult']
             items.append({
                 'name':      r.get('Name', 'Unknown'),
@@ -764,13 +882,13 @@ class CraftingCalculatorTab(QWidget):
                 return it['xp_eff'] * (1.0 + bonuses['double_chance']) / it['secs_eff'] * 3600
             return 0.0
 
-        rates = [exp_xph(it) for it in items]
+        rates      = [exp_xph(it) for it in items]
         total_rate = sum(rates)
-        weights = [r / total_rate for r in rates] if total_rate > 0 else [1.0 / len(items)] * len(items)
+        weights    = [r / total_rate for r in rates] if total_rate > 0 else [1.0 / len(items)] * len(items)
 
         for i, item in enumerate(items):
             xp_share = total_xp_needed * weights[i]
-            counts   = crafts_needed_for_xp(xp_share, item['xp_eff'], 1.0, bonuses['double_chance'])
+            counts   = crafts_needed_for_xp(xp_share, item['xp_eff'], bonuses['double_chance'])
             item['qty_min']      = counts['min']
             item['qty_expected'] = counts['expected']
             item['qty_max']      = counts['max']
@@ -781,13 +899,13 @@ class CraftingCalculatorTab(QWidget):
 
         self._last_items = items
 
-        grand_qty_min  = sum(it['qty_min']      for it in items)
-        grand_qty_exp  = sum(it['qty_expected']  for it in items)
-        grand_qty_max  = sum(it['qty_max']       for it in items)
-        grand_time_min = sum(it['time_min']      for it in items)
-        grand_time_exp = sum(it['time_exp']      for it in items)
-        grand_time_max = sum(it['time_max']      for it in items)
-        grand_xp_exp   = sum(it['xp_exp']        for it in items)
+        grand_qty_min  = sum(it['qty_min']     for it in items)
+        grand_qty_exp  = sum(it['qty_expected'] for it in items)
+        grand_qty_max  = sum(it['qty_max']      for it in items)
+        grand_time_min = sum(it['time_min']     for it in items)
+        grand_time_exp = sum(it['time_exp']     for it in items)
+        grand_time_max = sum(it['time_max']     for it in items)
+        grand_xp_exp   = sum(it['xp_exp']       for it in items)
 
         self.results_vbox.addWidget(self._make_bonus_card(bonuses))
         self.results_vbox.addWidget(
@@ -808,23 +926,29 @@ class CraftingCalculatorTab(QWidget):
     # ── Result card builders ─────────────────────────────────────────────────
     def _make_bonus_card(self, b: dict) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("QFrame{background:rgba(30,20,50,200);border:1px solid #555;border-radius:8px;} QLabel{color:#fff;}")
+        frame.setStyleSheet(
+            "QFrame{background:rgba(30,20,50,200);border:1px solid #555;border-radius:8px;} QLabel{color:#fff;}")
         lay = QVBoxLayout(frame); lay.setContentsMargins(10,7,10,7); lay.setSpacing(3)
-        lay.addWidget(QLabel("<b style='color:#c084fc;font-size:12px;'>⚙ Active Bonuses</b>"))
+        lay.addWidget(QLabel("<b style='color:#c084fc;font-size:12px;'>⚙ Active Bonuses Applied</b>"))
         grid = QGridLayout(); grid.setSpacing(5)
 
         def row(r, lbl, val, col="#fff"):
             grid.addWidget(QLabel(f"<span style='color:#aaa;font-size:11px;'>{lbl}</span>"), r, 0)
             grid.addWidget(QLabel(f"<b style='color:{col};font-size:11px;'>{val}</b>"), r, 1)
 
+        xb = b['xp_breakdown']
         t_pct = (1.0 - b['time_mult']) * 100.0
         d_pct = b['double_chance'] * 100.0
-        x_pct = (b['xp_mult'] - 1.0) * 100.0
         wb_str = f"T1×{b['t1']}  T2×{b['t2']}  T3×{b['t3']}  ({b['total_stations']} total)"
-        row(0, "Workbenches:", wb_str, "#ffd700")
-        row(1, "Effective Time Reduction:", f"{t_pct:.1f}%  (×{b['time_mult']:.3f})", "#4fc3f7")
-        row(2, "Effective 2x Chance:", f"{d_pct:.2f}%", "#81c784")
-        row(3, "XP Multiplier:", f"×{b['xp_mult']:.3f}  (+{x_pct:.1f}%)", "#ce93d8")
+
+        row(0, "Workbenches:",           wb_str,                                      "#ffd700")
+        row(1, "Time Reduction:",        f"{t_pct:.1f}%  (×{b['time_mult']:.3f})",   "#4fc3f7")
+        row(2, "2x Craft Chance:",       f"{d_pct:.2f}%",                             "#81c784")
+        row(3, "Buff Bracket:",          f"×{xb['buff_bracket']:.3f}",               "#ffb74d")
+        row(4, "Package Bracket:",       f"×{xb['pkg_bracket']:.3f}",                "#ffb74d")
+        row(5, "PVP Bracket:",           f"×{xb['pvp_bracket']:.2f}",                "#ffb74d")
+        row(6, "Altar Layer:",           f"×{xb['altar_layer']:.2f}",                "#ffb74d")
+        row(7, "Total XP Multiplier:",   f"×{xb['total_xp_mult']:.4f}",              "#ffd700")
         lay.addLayout(grid)
         return frame
 
@@ -832,7 +956,8 @@ class CraftingCalculatorTab(QWidget):
                            qty_min, qty_exp, qty_max,
                            t_min, t_exp, t_max, xp_exp) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("QFrame{background:rgba(13,71,161,35);border:1px solid #1565c0;border-radius:8px;} QLabel{color:#fff;}")
+        frame.setStyleSheet(
+            "QFrame{background:rgba(13,71,161,35);border:1px solid #1565c0;border-radius:8px;} QLabel{color:#fff;}")
         lay = QVBoxLayout(frame); lay.setContentsMargins(10,8,10,8); lay.setSpacing(4)
         lay.addWidget(QLabel(f"<b style='color:#00d4ff;font-size:14px;'>📊 Summary — Level {cur} → {tgt}</b>"))
         grid = QGridLayout(); grid.setSpacing(6)
@@ -858,30 +983,34 @@ class CraftingCalculatorTab(QWidget):
         if xp_exp >= xp_needed:
             status = QLabel("<b style='color:#4caf50;'>✔ Sufficient XP to reach target level</b>")
         else:
-            status = QLabel(f"<b style='color:#ff9800;'>⚠ Expected XP deficit: {xp_needed - xp_exp:,.0f} XP short</b>")
+            status = QLabel(
+                f"<b style='color:#ff9800;'>⚠ Expected XP deficit: {xp_needed - xp_exp:,.0f} XP short</b>")
         grid.addWidget(status, 4, 0, 1, 2)
         lay.addLayout(grid)
         return frame
 
     def _make_item_table(self, items: list, b: dict) -> QFrame:
         frame = QFrame()
-        frame.setStyleSheet("QFrame{background:rgba(20,20,20,200);border:1px solid #333;border-radius:8px;} QLabel{color:#00d4ff;font-weight:bold;font-size:13px;}")
+        frame.setStyleSheet(
+            "QFrame{background:rgba(20,20,20,200);border:1px solid #333;border-radius:8px;} "
+            "QLabel{color:#00d4ff;font-weight:bold;font-size:13px;}")
         lay = QVBoxLayout(frame); lay.setContentsMargins(10,8,10,8); lay.setSpacing(5)
         lay.addWidget(QLabel("🔨 Crafting Breakdown"))
 
         has_range = b['double_chance'] > 0
         if has_range:
-            hdrs = ["Item", "XP/Craft", "Time/Craft",
+            hdrs = ["Item", "Base XP", "Eff. XP/Craft", "Time/Craft",
                     "Qty Min", "Qty Exp", "Qty Max",
                     "Time Min", "Time Exp", "Time Max"]
         else:
-            hdrs = ["Item", "XP/Craft (eff.)", "Time/Craft (eff.)", "Qty", "Total XP", "Total Time"]
+            hdrs = ["Item", "Base XP", "Eff. XP/Craft", "Time/Craft", "Qty", "Total XP", "Total Time"]
 
         table = QTableWidget(len(items), len(hdrs))
         table.setHorizontalHeaderLabels(hdrs)
         table.setStyleSheet("""
             QTableWidget { background:#0d0d0d; color:#fff; border:none; gridline-color:#333; font-size:12px; }
-            QHeaderView::section { background:#1a1a1a; color:#00d4ff; border:1px solid #333; padding:4px; font-weight:bold; font-size:11px; }
+            QHeaderView::section { background:#1a1a1a; color:#00d4ff; border:1px solid #333;
+                                   padding:4px; font-weight:bold; font-size:11px; }
             QTableWidget::item { padding:3px 5px; }
             QTableWidget::item:selected { background:#1a3a5c; }
             QTableWidget { alternate-background-color:#111; }
@@ -900,20 +1029,22 @@ class CraftingCalculatorTab(QWidget):
             return it
 
         for ri, item in enumerate(items):
-            table.setItem(ri, 0, cell(item['name'], "#fff", Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
-            table.setItem(ri, 1, cell(f"{item['xp_eff']:,.1f}", "#00d4ff"))
-            table.setItem(ri, 2, cell(format_time_hms(item['secs_eff']), "#aaa"))
+            table.setItem(ri, 0, cell(item['name'], "#fff",
+                                      Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter))
+            table.setItem(ri, 1, cell(f"{item['xp_base']:,}", "#aaa"))
+            table.setItem(ri, 2, cell(f"{item['xp_eff']:,.2f}", "#00d4ff"))
+            table.setItem(ri, 3, cell(format_time_hms(item['secs_eff']), "#aaa"))
             if has_range:
-                table.setItem(ri, 3, cell(f"{item['qty_min']:,}", "#81c784"))
-                table.setItem(ri, 4, cell(f"{item['qty_expected']:,}", "#4caf50"))
-                table.setItem(ri, 5, cell(f"{item['qty_max']:,}", "#ff9800"))
-                table.setItem(ri, 6, cell(format_time_hms(item['time_min']), "#81c784"))
-                table.setItem(ri, 7, cell(format_time_hms(item['time_exp']), "#ffd700"))
-                table.setItem(ri, 8, cell(format_time_hms(item['time_max']), "#ff9800"))
+                table.setItem(ri, 4, cell(f"{item['qty_min']:,}", "#81c784"))
+                table.setItem(ri, 5, cell(f"{item['qty_expected']:,}", "#4caf50"))
+                table.setItem(ri, 6, cell(f"{item['qty_max']:,}", "#ff9800"))
+                table.setItem(ri, 7, cell(format_time_hms(item['time_min']), "#81c784"))
+                table.setItem(ri, 8, cell(format_time_hms(item['time_exp']), "#ffd700"))
+                table.setItem(ri, 9, cell(format_time_hms(item['time_max']), "#ff9800"))
             else:
-                table.setItem(ri, 3, cell(f"{item['qty_expected']:,}", "#4caf50"))
-                table.setItem(ri, 4, cell(f"{item['xp_exp']:,.0f}", "#4caf50"))
-                table.setItem(ri, 5, cell(format_time_hms(item['time_exp']), "#ffd700"))
+                table.setItem(ri, 4, cell(f"{item['qty_expected']:,}", "#4caf50"))
+                table.setItem(ri, 5, cell(f"{item['xp_exp']:,.0f}", "#4caf50"))
+                table.setItem(ri, 6, cell(format_time_hms(item['time_exp']), "#ffd700"))
 
         row_h = 26
         table.setFixedHeight(table.horizontalHeader().height() + len(items) * row_h + 4)
@@ -928,36 +1059,31 @@ class CraftingCalculatorTab(QWidget):
         return frame
 
     def _make_materials_card(self, items: list) -> QFrame:
-        """Materials card with Min / Expected / Max mode selector."""
         frame = QFrame()
-        frame.setStyleSheet("QFrame{background:rgba(20,20,20,200);border:1px solid #333;border-radius:8px;}")
+        frame.setStyleSheet(
+            "QFrame{background:rgba(20,20,20,200);border:1px solid #333;border-radius:8px;}")
         lay = QVBoxLayout(frame); lay.setContentsMargins(10,8,10,8); lay.setSpacing(6)
 
-        # Header row with mode dropdown
         hdr_row = QHBoxLayout()
         hdr_row.addWidget(QLabel("<b style='color:#ffd700;font-size:13px;'>📦 Total Materials Required</b>"))
         hdr_row.addStretch()
         hdr_row.addWidget(QLabel("<span style='color:#aaa;font-size:11px;'>Show quantities for:</span>"))
         self.mat_mode_combo = QComboBox()
         self.mat_mode_combo.setStyleSheet(_COMBO_SS)
-        self.mat_mode_combo.setFixedWidth(130)
+        self.mat_mode_combo.setFixedWidth(150)
         self.mat_mode_combo.addItems(["Expected (Avg)", "Minimum (Best)", "Maximum (Worst)"])
         self.mat_mode_combo.currentIndexChanged.connect(self._refresh_materials_table)
         hdr_row.addWidget(self.mat_mode_combo)
         lay.addLayout(hdr_row)
 
-        # Table container — we'll rebuild the table on mode change
         self.mat_table_container = QVBoxLayout()
         self.mat_table_container.setSpacing(0)
         lay.addLayout(self.mat_table_container)
 
-        # Build initial table
         self._refresh_materials_table()
         return frame
 
     def _refresh_materials_table(self):
-        """Rebuild the materials table based on current mode selection."""
-        # Clear old table
         while self.mat_table_container.count():
             w = self.mat_table_container.takeAt(0).widget()
             if w:
@@ -973,7 +1099,6 @@ class CraftingCalculatorTab(QWidget):
         mode_idx = self.mat_mode_combo.currentIndex()
         qty_key  = ['qty_expected', 'qty_min', 'qty_max'][mode_idx]
 
-        # Aggregate materials
         agg: dict[str, int] = {}
         for item in items:
             qty = item.get(qty_key, item['qty_expected'])
@@ -994,7 +1119,8 @@ class CraftingCalculatorTab(QWidget):
         table.setHorizontalHeaderLabels(["Material", "Quantity Needed"])
         table.setStyleSheet("""
             QTableWidget { background:#0d0d0d; color:#fff; border:none; gridline-color:#333; font-size:12px; }
-            QHeaderView::section { background:#1a1a1a; color:#ffd700; border:1px solid #333; padding:4px; font-weight:bold; }
+            QHeaderView::section { background:#1a1a1a; color:#ffd700; border:1px solid #333;
+                                   padding:4px; font-weight:bold; }
             QTableWidget::item { padding:3px 6px; }
             QTableWidget::item:selected { background:#1a3a5c; }
             QTableWidget { alternate-background-color:#111; }
@@ -1014,8 +1140,8 @@ class CraftingCalculatorTab(QWidget):
             table.setItem(ri, 0, ni)
             table.setItem(ri, 1, qi)
 
-        row_h = 25
+        row_h  = 25
         max_vis = 16
-        vis = min(len(agg), max_vis)
+        vis    = min(len(agg), max_vis)
         table.setFixedHeight(table.horizontalHeader().height() + vis * row_h + 4)
         self.mat_table_container.addWidget(table)
